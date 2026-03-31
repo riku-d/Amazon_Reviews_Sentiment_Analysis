@@ -30,6 +30,7 @@ from wordcloud import WordCloud
 from collections import Counter
 import warnings
 warnings.filterwarnings("ignore")
+from sklearn.metrics import recall_score,precision_score
 
 # ── NLTK ──────────────────────────────────────────────────────────────────────
 @st.cache_resource
@@ -86,6 +87,15 @@ html,body,[class*="css"]{ font-family:'DM Sans',sans-serif; }
            border-radius:30px; font-weight:700; font-size:1.1rem; display:inline-block; }
 .neg-pill{ background:#f8d7da; color:#721c24; padding:0.5rem 1.6rem;
            border-radius:30px; font-weight:700; font-size:1.1rem; display:inline-block; }
+.neu-pill{
+    background:#fff3cd;
+    color:#856404;
+    padding:0.5rem 1.6rem;
+    border-radius:30px;
+    font-weight:700;
+    font-size:1.1rem;
+    display:inline-block;
+}
 
 .info-box{ background:linear-gradient(135deg,#0d1b2a 0%,#1b3a5c 55%,#0d1b2a 100%);border-left:4px solid #146EB4;
            border-radius:8px; padding:0.8rem 1rem; margin:0.5rem 0; }
@@ -189,13 +199,12 @@ with st.sidebar:
     if model:
         # Safe values
         bp = metrics["best_params"]
-        kernel_val = bp.get("kernel", "Linear (LinearSVC)")
+        kernel_val = bp.get("Linear (LinearSVC)")
 
         st.markdown(
-            f'<div class="mono">kernel = <b>{kernel_val}</b><br>'
+            f'<div class="mono">Model = LinearSVC</b><br>'
             f'C      = <b>{bp["C"]}</b><br>'
-            f'SMOTE  = <b>✅</b> · VADER = <b>✅</b><br>'
-            f'Phrases= <b>✅</b></div>',
+            f'SMOTE  · VADER ',
             unsafe_allow_html=True
         )
         st.markdown("---")
@@ -267,11 +276,11 @@ cb               = di
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1,tab2,tab3,tab4,tab5 = st.tabs([
-    "📊  EDA",
-    "⚙️  Pipeline",
-    "🤖  Model & Tuning",
-    "🔍  Predict",
-    "📈  Metrics",
+    "EDA",
+    "Pipeline",
+    "Model & Tuning",
+    "Predict",
+    "Metrics",
 ])
 
 # ══════════════════════════════════════════════════════
@@ -425,7 +434,7 @@ with tab1:
 # TAB 2 · Pipeline
 # ══════════════════════════════════════════════════════
 with tab2:
-    st.subheader("⚙️ Preprocessing Pipeline")
+    st.subheader("Preprocessing Pipeline")
 
     st.markdown("""
     <div class="info-box">
@@ -447,7 +456,7 @@ with tab2:
         ("9️⃣  TF-IDF (trigrams)",      "max_features=5000, ngram_range=(1,3), sublinear_tf=True, min_df=2"),
         ("🔟  VADER Lexicon",          "4 numeric features: compound/pos/neg/neu — catches implicit sentiment"),
         ("1️⃣1️⃣  Phrase Blacklist",      f"{len(negative_phrases)} negative phrases: 'waste of money', 'stopped working'..."),
-        ("1️⃣2️⃣  MinMaxScaler",          "Scale all 5005 features to [0,1] for SVM's distance geometry"),
+        ("1️⃣2️⃣  MaxAbsScaler",          "Scales features to [-1,1] while preserving sparsity of TF-IDF vectors"),
         ("1️⃣3️⃣  SMOTE",                f"Applied if imbalance ratio > 1.5 — balances training set synthetically"),
     ]
     for title,desc in steps:
@@ -455,7 +464,7 @@ with tab2:
             st.markdown(desc)
 
     st.markdown("---")
-    st.markdown("### 🧠 SVM Theory")
+    st.markdown("### SVM Theory")
     col_l, col_r = st.columns([1.2,1])
     with col_l:
         st.markdown("""
@@ -556,7 +565,7 @@ with tab3:
     )
 
     st.markdown("---")
-    st.markdown("### 📊 Performance Summary")
+    st.markdown("### Performance Summary")
     perf_df = pd.DataFrame([
         {"Metric":"Train Accuracy",  "Value":f"{metrics['train_accuracy']*100:.2f}%"},
         {"Metric":"Test Accuracy",   "Value":f"{metrics['test_accuracy']*100:.2f}%"},
@@ -643,49 +652,107 @@ with tab3:
 # TAB 4 · Predict
 # ══════════════════════════════════════════════════════
 with tab4:
-    st.subheader("🔍 Real-Time Sentiment Prediction")
-    st.markdown("**VADER + phrase detection + SVM** — catches both explicit and implicit negatives. ⚡")
+    st.subheader("Real-Time Sentiment Prediction")
+    st.markdown("**VADER + phrase detection + SVM** — catches both explicit and implicit negatives.")
 
+    # ── Helper Functions ─────────────────────────────────────────────
+    def get_label(prob_pos, prob_neg, vader_sc, n_ph, threshold):
+        # Strong neutral condition
+        if abs(vader_sc["compound"]) < 0.2 and n_ph == 0:
+            return 0
+        
+        if abs(prob_pos - prob_neg) < 0.15:
+            return 0
+        
+        elif prob_pos >= threshold:
+            return 2
+        else:
+            return 1
+
+    def confidence_label(prob):
+        if prob > 0.8:
+            return "🔥 Very High"
+        elif prob > 0.6:
+            return "👍 High"
+        elif prob > 0.4:
+            return "⚖️ Medium"
+        else:
+            return "⚠️ Low"
+
+    # ── Threshold ────────────────────────────────────────────────────
     c_set,_ = st.columns([1,2])
     with c_set:
         user_threshold = st.slider(
             "Prediction threshold",
             min_value=0.20, max_value=0.60,
             value=float(threshold), step=0.05,
-            help="Predict Positive only if P(positive) ≥ threshold. Lower = more sensitive to negatives."
+            help="Predict Positive only if P(positive) ≥ threshold."
         )
 
+    # ── Input ────────────────────────────────────────────────────────
     user_rev = st.text_area(
-        "Enter an Amazon product review (title + review body):",
-        placeholder='"Waste of money. Stopped working after a week. Would not recommend."'
-                    '\nor\n'
-                    '"Amazing product! Works exactly as described, very happy with this purchase."',
+        "Enter an Amazon product review :",
+        placeholder='"Amazing product! Works exactly as described, very happy with this purchase."',
         height=130
     )
 
-    if st.button("🚀  Predict Sentiment", type="primary"):
+    # ── Prediction ───────────────────────────────────────────────────
+    if st.button("Predict Sentiment", type="primary"):
         if not user_rev.strip():
             st.warning("Please enter a review.")
         else:
-            pred,prob_pos,prob_neg,vader_sc,n_ph = run_predict(
+            pred, prob_pos, prob_neg, vader_sc, n_ph = run_predict(
                 user_rev, contractions, negative_phrases, user_threshold)
-            pill  = "pos-pill" if pred==2 else "neg-pill"
-            label = "Positive ✅" if pred==2 else "Negative ❌"
+
+            pred = get_label(prob_pos, prob_neg, vader_sc, n_ph, user_threshold)
+
+            # ── Label Styling ────────────────────────────────────────
+            if pred == 2:
+                pill  = "pos-pill"
+                label = "Positive ✅"
+            elif pred == 1:
+                pill  = "neg-pill"
+                label = "Negative ❌"
+            else:
+                pill  = "neu-pill"
+                label = "Neutral 😐"
+
+            # ── Confidence ───────────────────────────────────────────
+            prob_neutral = 1 - abs(prob_pos - prob_neg)
 
             st.markdown("---")
-            c1,c2,c3 = st.columns(3)
-            with c1: st.markdown(f'<br><span class="{pill}">{label}</span>',unsafe_allow_html=True)
-            with c2: st.metric("Positive confidence",f"{prob_pos*100:.1f}%")
-            with c3: st.metric("Negative confidence",f"{prob_neg*100:.1f}%")
+            c1,c2,c3,c4 = st.columns(4)
 
+            with c1:
+                st.markdown(f'<br><span class="{pill}">{label}</span>', unsafe_allow_html=True)
+
+            with c2:
+                st.metric("Positive", f"{prob_pos*100:.1f}%")
+
+            with c3:
+                st.metric("Negative", f"{prob_neg*100:.1f}%")
+
+            with c4:
+                st.metric("Neutral", f"{prob_neutral*100:.1f}%")
+
+            # ── Confidence Label + Margin ────────────────────────────
+            st.caption(f"Confidence Level: {confidence_label(prob_pos)}")
+            margin = abs(prob_pos - 0.5)
+            st.caption(f"Decision Margin: {margin:.3f}")
+
+            # ── Gauge ───────────────────────────────────────────────
             fig_g = go.Figure(go.Indicator(
                 mode="gauge+number+delta",
                 value=prob_pos*100,
                 delta={"reference":user_threshold*100},
-                title={"text":"Positive Sentiment Score (%)"},
+                title={"text":"📊 Sentiment Score (%)"},
                 gauge={
                     "axis":{"range":[0,100]},
-                    "bar":{"color":"#28a745" if pred==2 else "#dc3545"},
+                    "bar":{"color":
+                        "#28a745" if pred==2 else
+                        "#dc3545" if pred==1 else
+                        "#ffc107"
+                    },
                     "steps":[
                         {"range":[0,user_threshold*100],"color":"#fde8ea"},
                         {"range":[user_threshold*100,65],"color":"#fff9e6"},
@@ -694,61 +761,102 @@ with tab4:
                     "threshold":{"line":{"color":"#232F3E","width":3},"value":user_threshold*100}
                 }
             ))
-            fig_g.update_layout(height=280,margin=dict(t=60,b=10,l=20,r=20))
+            fig_g.update_layout(height=280, margin=dict(t=60,b=10,l=20,r=20))
             st.plotly_chart(fig_g, width="stretch")
 
-            st.markdown("#### 🔬 Feature Breakdown")
+            # ── Auto Suggestion ─────────────────────────────────────
+            if prob_neg > 0.7:
+                st.error("⚠️ Strong negative sentiment detected.")
+            elif pred == 0:
+                st.warning("🤔 This review seems neutral or mixed.")
+            else:
+                st.success("✅ Positive sentiment detected.")
+
+            # ── Feature Breakdown ───────────────────────────────────
+            st.markdown("####Feature Breakdown")
             fa,fb_col,fc = st.columns(3)
+
+            # VADER
             with fa:
                 st.markdown("**VADER Scores**")
                 st.dataframe(pd.DataFrame({
                     "Score":  ["Negative","Positive","Neutral","Compound"],
-                    "Value":  [round(vader_sc["neg"],3),round(vader_sc["pos"],3),
-                               round(vader_sc["neu"],3),round(vader_sc["compound"],3)]
-                }),width="stretch",hide_index=True)
+                    "Value":  [
+                        round(vader_sc["neg"],3),
+                        round(vader_sc["pos"],3),
+                        round(vader_sc["neu"],3),
+                        round(vader_sc["compound"],3)
+                    ]
+                }), width="stretch", hide_index=True)
+
+            # Phrase Detection (Improved)
             with fb_col:
                 st.markdown("**Phrase Hits**")
-                matched = [p for p in negative_phrases if p in user_rev.lower()]
+                import re
+                matched = [p for p in negative_phrases if re.search(rf"\b{p}\b", user_rev.lower())]
+
                 if matched:
                     st.error(f"**{len(matched)} negative phrase(s):**\n\n" +
                              "\n".join(f"• {p}" for p in matched))
                 else:
                     st.success("No negative phrases detected")
+
+            # Tokens
             with fc:
                 st.markdown("**Tokens (preview)**")
                 toks = build_tokens(user_rev, contractions)
-                st.code(" · ".join(toks[:30])+("..." if len(toks)>30 else ""))
+                st.code(" · ".join(toks[:30]) + ("..." if len(toks)>30 else ""))
 
+    # ── Samples ──────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("#### 🧪 Sample Reviews")
+    st.markdown("#### Sample Reviews")
+
     samples = {
-        "😊 Excelent Product":     ("Absolutely love this! Best smart speaker ever. Plays music perfectly, controls all my devices, answers every question. 5 stars!",2),
-        "😡 Broke quickly":        ("Terrible product. Broke after a week. Support was useless. Wasted my money. Horrible experience. Will never buy again.",1),
-        "😐 Neutral / Mixed":      ("It works great for basic use but nothing special, don't buy",1),
-        "👍 Good value":          ("Good product for the price. Does what it says. Happy with it.", 2),
+        "😊 Excellent Product": ("Absolutely love this! Best smart speaker ever.", 2),
+        "😡 Broke quickly": ("Terrible product. Broke after a week.", 1),
+        "😐 Neutral / Mixed": ("It works fine but not satisfying.", 0),
+        "👍 Good value": ("Good product for the price.", 2),
     }
+
     cols = st.columns(2)
+
     for i,(lbl,(txt,true_lbl)) in enumerate(samples.items()):
         with cols[i%2]:
             with st.expander(lbl):
                 st.write(txt)
-                st.caption(f"True label: {'✅ Positive' if true_lbl==2 else '❌ Negative'}")
+
+                label_map = {
+                    2: "✅ Positive",
+                    1: "❌ Negative",
+                    0: "😐 Neutral"
+                }
+
+                st.caption(f"True label: {label_map[true_lbl]}")
+
                 if st.button("Predict this", key=lbl):
                     p,pp,pn,vs,np_ = run_predict(txt,contractions,negative_phrases,user_threshold)
-                    result  = "✅ Positive" if p==2 else "❌ Negative"
-                    correct = "🎯 Correct!" if p==true_lbl else "⚠️ Missed"
-                    st.markdown(f"**{result}** — P(pos):{pp*100:.1f}% {correct}")
-                    if vs["compound"]<0 or np_>0:
-                        st.caption(f"VADER:{vs['compound']:.3f} · Phrases:{np_}")
+                    p = get_label(pp, pn, vs, np_, user_threshold)
+
+                    result  = label_map[p]
+                    correct = "Correct!" if p==true_lbl else "⚠️ Missed"
+
+                    st.markdown(f"**{result}** — P(pos): {pp*100:.1f}% {correct}")
+
+                    if vs["compound"] < 0 or np_ > 0:
+                        st.caption(f"VADER: {vs['compound']:.3f} · Phrases: {np_}")
 
 
 # ══════════════════════════════════════════════════════
 # TAB 5 · Metrics
-# ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════                       
 with tab5:
-    st.subheader("📈 Full Metrics Dashboard")
+    st.subheader("Full Metrics Dashboard")
 
+    # ─────────────────────────────────────────────
+    # Per-Class Metrics
+    # ─────────────────────────────────────────────
     st.markdown("### Per-Class Metrics")
+
     class_data = []
     for cls in ["Negative","Positive"]:
         if cls in rpt:
@@ -759,11 +867,25 @@ with tab5:
                 "F1-Score %":  round(rpt[cls]["f1-score"]*100,2),
                 "Support":     int(rpt[cls]["support"]),
             })
-    st.dataframe(pd.DataFrame(class_data),width="stretch",hide_index=True)
 
-    
+    df_cls = pd.DataFrame(class_data)
+    st.dataframe(df_cls, width="stretch", hide_index=True)
+
+    # Bar Chart
+    fig_bar = px.bar(
+        df_cls.melt(id_vars="Class", value_vars=["Precision %","Recall %","F1-Score %"]),
+        x="variable", y="value", color="Class", barmode="group",
+        title="Per-Class Metric Comparison", text_auto=True
+    )
+    fig_bar.update_layout(template="simple_white")
+    st.plotly_chart(fig_bar, width="stretch")
+
+    # ─────────────────────────────────────────────
+    # Macro / Weighted
+    # ─────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### Macro & Weighted Averages")
+
     avg_data = []
     for avg_type in ["macro avg","weighted avg"]:
         if avg_type in rpt:
@@ -773,30 +895,69 @@ with tab5:
                 "Recall %":    round(rpt[avg_type]["recall"]*100,2),
                 "F1-Score %":  round(rpt[avg_type]["f1-score"]*100,2),
             })
-    st.dataframe(pd.DataFrame(avg_data),width="stretch",hide_index=True)
 
+    st.dataframe(pd.DataFrame(avg_data), width="stretch", hide_index=True)
+
+    # ─────────────────────────────────────────────
+    # KPI Metrics
+    # ─────────────────────────────────────────────
     st.markdown("---")
     c1,c2,c3,c4 = st.columns(4)
+
     c1.metric("Test Accuracy",  f"{metrics['test_accuracy']*100:.2f}%")
     c2.metric("ROC-AUC",        f"{metrics['roc_auc']:.4f}")
     c3.metric("Neg Recall",     f"{rpt['Negative']['recall']*100:.1f}%")
     c4.metric("Macro F1",       f"{rpt['macro avg']['f1-score']*100:.1f}%")
 
+    # ─────────────────────────────────────────────
+    # ROC Curve
+    # ─────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 🏁 Design Decisions")
+    st.markdown("### ROC Curve")
+
+    fpr = metrics["roc_fpr"]
+    tpr = metrics["roc_tpr"]
+
+    fig_roc = go.Figure()
+    fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines",
+        name=f"AUC = {metrics['roc_auc']:.3f}",
+        line=dict(width=3)
+    ))
+    fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1],
+        mode="lines", name="Random", line=dict(dash="dash")
+    ))
+    fig_roc.update_layout(template="simple_white")
+    st.plotly_chart(fig_roc, width="stretch")
+
+    # ─────────────────────────────────────────────
+    # Confusion Matrix
+    # ─────────────────────────────────────────────
+    st.markdown("### Confusion Matrix")
+
+    cm = np.array(metrics["confusion_matrix"])
+    fig_cm = px.imshow(cm, text_auto=True,
+                       labels=dict(x="Predicted", y="Actual"),
+                       x=["Negative","Positive"],
+                       y=["Negative","Positive"],
+                       )
+    st.plotly_chart(fig_cm, width="stretch")
+
+    
+    # ─────────────────────────────────────────────
+    # Design Decisions
+    # ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Design Decisions")
+
     st.markdown(f"""
 | Decision | Choice | Justification |
 |---|---|---|
 | **Algorithm** | SVM | Max-margin; excels in high-dim TF-IDF space |
-| **Kernel** | `Linear (LinearSVC)` | Best F1-macro via 120-fit GridSearchCV |
-| **C** | `{bp['C']}` | Regularisation — optimised on F1-macro |
-| **Text fields** | title + review | Title carries strong sentiment signal |
-| **n-grams** | trigrams (1,3) | "does not work" as one feature unit |
-| **Features** | TF-IDF + VADER + phrases | VADER catches implicit negatives TF-IDF misses |
-| **Imbalance** | SMOTE | Synthetic minorities → balanced training |
-| **class_weight** | balanced | Equal misclassification cost per class |
-| **Threshold** | {threshold} | Tuned for better negative recall |
-| **Scoring** | F1-macro | Treats both classes equally in grid search |
-| **Scaling** | MinMaxScaler | SVM distances require normalised inputs |
-| **Negation** | Prefix `not_` | "not good" ≠ "good" without this |
+| **Kernel** | `Linear (LinearSVC)` | Best F1-macro |
+| **C** | `{bp['C']}` | Regularisation |
+| **Features** | TF-IDF + VADER | Hybrid model |
+| **Imbalance** | SMOTE | Balanced training |
+| **Threshold** | {threshold} | Tuned for recall |
+| **Scaling** | MaxAbsScaler | Scale all features to [0,1]|
+| **Negation** | Prefix `not_` | Preserves sentiment |
 """)
